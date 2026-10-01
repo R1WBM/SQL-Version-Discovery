@@ -301,4 +301,6 @@ The default generated CSV filenames are excluded by [`.gitignore`](./.gitignore)
 
 ## License
 
-The source and documentation in this repository are available under the [MIT License](./LICENSE). The license includes an explicit warranty disclaimer; the operational safety warnings above still apply.
+The source and documentation in this repository are licensed under the [GNU General Public License v3.0 only](./LICENSE) (`GPL-3.0-only`). The license includes explicit warranty and liability disclaimers; the operational safety warnings above still apply.
+
+Earlier revisions released under the MIT License remain available under the terms that accompanied those revisions.

@@ -4,6 +4,8 @@
 ================================================================================
 
  Author   : Russell McKee
+ Copyright: Copyright (C) 2026 Russell McKee
+ SPDX-License-Identifier: GPL-3.0-only
  LinkedIn : https://www.linkedin.com/in/russellwbmckee/
  Version  : 2.1
  Updated  : 25 September 2026
