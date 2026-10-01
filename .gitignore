@@ -1,0 +1,8 @@
+# Generated discovery results may contain sensitive infrastructure data.
+SQL-Discovery-DomainController.csv
+SQL-Discovery-MemberServer.csv
+
+# Local PowerShell and editor artifacts.
+*.log
+*.tmp
+.vscode/

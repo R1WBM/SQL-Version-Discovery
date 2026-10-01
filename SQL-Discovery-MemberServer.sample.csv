@@ -1,0 +1,2 @@
+"ServerName","InstanceName","FQDN","IPAddress","SQLRelease","SQLVersion","PatchLevel","SQLEdition","EditionType","Collation","InstanceKey","DetectedBy","DiscoveredVia","Status","ScanTime"
+"SQLTEST-SQL01","MSSQLSERVER","SQLTEST-SQL01.sqltest.local","10.20.1.6","SQL Server 2022","16.0.1000.6","16.0.4255.1","Developer Edition","Developer Edition","SQL_Latin1_General_CP1_CI_AS","MSSQL16.MSSQLSERVER","TCP port 1433","Subnet scan + Remote Registry","OK","2026-09-25T19:55:29"
