@@ -25,8 +25,6 @@ Both scripts enrich discovered instances by reading the Windows registry remotel
 | [`SQL-Discovery-DomainController.ps1`](./SQL-Discovery-DomainController.ps1) | Discovers SQL Server instances through Active Directory SPNs |
 | [`SQL-Discovery-MemberServer.ps1`](./SQL-Discovery-MemberServer.ps1) | Scans an IPv4 subnet for SQL Server instances |
 | [`SQL-Discovery-Toolkit.md`](./SQL-Discovery-Toolkit.md) | Full design, usage, reference, and troubleshooting guide |
-| [`SQL-Discovery-Toolkit.docx`](./SQL-Discovery-Toolkit.docx) | Downloadable Word version of the full guide |
-| [`SQL-Server-2016-End-of-Support-Discover-Decide-Modernise.pptx`](./SQL-Server-2016-End-of-Support-Discover-Decide-Modernise.pptx) | Supporting presentation |
 | [`SQL-Discovery-DomainController.sample.csv`](./SQL-Discovery-DomainController.sample.csv) | Sanitized example Active Directory discovery output |
 | [`SQL-Discovery-MemberServer.sample.csv`](./SQL-Discovery-MemberServer.sample.csv) | Sanitized example subnet discovery output |
 
