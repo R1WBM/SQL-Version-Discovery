@@ -6,3 +6,6 @@ SQL-Discovery-MemberServer.csv
 *.log
 *.tmp
 .vscode/
+
+# Local archive of earlier script versions.
+/v1/
