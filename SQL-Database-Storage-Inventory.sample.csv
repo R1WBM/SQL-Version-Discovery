@@ -1,0 +1,2 @@
+"ServerName","InstanceName","FQDN","IPAddress","DataSource","SQLRelease","SQLVersion","DatabaseCount","DatabasesMeasured","DataUsedGB","LogUsedGB","TotalStorageUsedGB","Status","ScanTime"
+"SQLTEST-SQL01","MSSQLSERVER","sqltest-sql01.sqltest.local","10.20.1.6","tcp:sqltest-sql01.sqltest.local,1433","SQL Server 2022","16.0.1000.6","6","6","1.691","0.006","1.697","OK","2026-10-02T11:12:11"

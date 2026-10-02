@@ -28,6 +28,7 @@ Both scripts enrich discovered instances by reading the Windows registry remotel
 | [`SQL-Discovery-Toolkit.md`](./SQL-Discovery-Toolkit.md) | Full design, usage, reference, and troubleshooting guide |
 | [`SQL-Discovery-DomainController.sample.csv`](./SQL-Discovery-DomainController.sample.csv) | Sanitized example Active Directory discovery output |
 | [`SQL-Discovery-MemberServer.sample.csv`](./SQL-Discovery-MemberServer.sample.csv) | Sanitized example subnet discovery output |
+| [`SQL-Database-Storage-Inventory.sample.csv`](./SQL-Database-Storage-Inventory.sample.csv) | Sanitized example database storage inventory output |
 
 ## Choosing a script
 
@@ -260,6 +261,20 @@ The default report is written to
 `.\SQL-Database-Storage-Inventory.csv`. Instances or databases that cannot be
 queried remain in the report with `FAILED` or `PARTIAL` status.
 
+Review the sanitized example report:
+
+- [`SQL-Database-Storage-Inventory.sample.csv`](./SQL-Database-Storage-Inventory.sample.csv)
+
+The sample shows one successfully queried default instance with six databases.
+All six were measured, using 1.691 GB of data pages and 0.006 GB of transaction
+log space, for 1.697 GB total actual storage used. Inventory columns include:
+
+- Server, instance, FQDN, IP address, and SQL connection target
+- SQL Server release and version inherited from discovery
+- Total databases found and databases successfully measured
+- Actual data, transaction-log, and combined storage used in GB
+- `OK`, `PARTIAL`, or `FAILED` status and scan timestamp
+
 Detailed diagnostics are appended to
 `.\SQL-Database-Storage-Inventory-Diagnostics.txt` by default. Console warnings
 include diagnostic IDs that identify the matching text-file entries. Error
@@ -467,6 +482,7 @@ Review the sample reports before running:
 
 - [`SQL-Discovery-DomainController.sample.csv`](./SQL-Discovery-DomainController.sample.csv)
 - [`SQL-Discovery-MemberServer.sample.csv`](./SQL-Discovery-MemberServer.sample.csv)
+- [`SQL-Database-Storage-Inventory.sample.csv`](./SQL-Database-Storage-Inventory.sample.csv)
 
 To compare results by server and instance:
 
