@@ -24,6 +24,7 @@ Both scripts enrich discovered instances by reading the Windows registry remotel
 |---|---|
 | [`SQL-Discovery-DomainController.ps1`](./SQL-Discovery-DomainController.ps1) | Discovers SQL Server instances through Active Directory SPNs |
 | [`SQL-Discovery-MemberServer.ps1`](./SQL-Discovery-MemberServer.ps1) | Scans an IPv4 subnet for SQL Server instances |
+| [`SQL-Database-Storage-Inventory.ps1`](./SQL-Database-Storage-Inventory.ps1) | Counts databases and measures actual data and transaction-log storage used |
 | [`SQL-Discovery-Toolkit.md`](./SQL-Discovery-Toolkit.md) | Full design, usage, reference, and troubleshooting guide |
 | [`SQL-Discovery-DomainController.sample.csv`](./SQL-Discovery-DomainController.sample.csv) | Sanitized example Active Directory discovery output |
 | [`SQL-Discovery-MemberServer.sample.csv`](./SQL-Discovery-MemberServer.sample.csv) | Sanitized example subnet discovery output |
@@ -35,9 +36,242 @@ Both scripts enrich discovered instances by reading the Windows registry remotel
 | Which SQL Server instances are registered in Active Directory? | `SQL-Discovery-DomainController.ps1` |
 | What SQL Server instances respond within a known subnet? | `SQL-Discovery-MemberServer.ps1` |
 | Which instances may be unregistered or shadow IT? | Run both and compare their output |
-| Do I need a SQL Server login? | No; registry enrichment uses Windows administrator access |
+| Do discovery scans need a SQL Server login? | No; discovery enrichment uses Windows remote-registry access |
+| Does database storage inventory need a SQL Server login? | Yes; the Windows or SQL identity must exist as a login on every queried SQL instance |
 
 The scripts are complementary. Active Directory discovery is fast but can miss instances without an SPN. Subnet discovery can find unregistered instances but is limited to the authorized networks and ports you scan.
+
+## Database storage inventory
+
+### How it connects
+
+The storage inventory uses .NET `System.Data.SqlClient.SqlConnection` to make a
+normal SQL Server connection from the member server. It does not use remote
+PowerShell, WMI, or the remote registry for database measurements.
+
+Connection targets are derived from each discovery CSV row:
+
+- A detected TCP port becomes `tcp:FQDN,port`.
+- A named instance becomes `FQDN\InstanceName`.
+- A default instance without a detected port uses its FQDN or server name.
+
+The member server must be able to resolve the target name and reach the SQL
+Server listening port through intervening firewalls. Named instances without a
+known port may also require SQL Server Browser/UDP 1434.
+
+Authentication behavior is:
+
+1. **Windows Integrated Authentication is the default.** If
+   `-Credential` is omitted and `-AuthMode CurrentUser` is active,
+   `Integrated Security=True` is used. SQL Server sees the Windows identity
+   running PowerShell. Confirm it before running:
+
+   ```powershell
+   whoami
+   ```
+
+2. **SQL authentication is used when `-AuthMode Prompt` or `-Credential` is
+   supplied.** Prompt mode securely requests a SQL login and password.
+   `-Credential` accepts an existing `PSCredential` and takes precedence over
+   `-AuthMode`. The earlier `-SqlCredential` parameter name remains available
+   as an alias. These options do not impersonate another Windows account.
+
+3. **The script does not silently switch authentication methods after a failed
+   login.** It uses Windows authentication for the entire run when the default
+   `-AuthMode CurrentUser` is active and no credential was supplied. It uses
+   SQL authentication for the entire run when prompt mode or an explicit
+   credential supplies a SQL login.
+
+To use a different Windows identity, launch PowerShell as that identity and run
+the script with the default `-AuthMode CurrentUser`. A SQL connection cannot
+use a `PSCredential` as an alternate Windows identity merely by placing it in a
+connection string.
+
+Encryption is not explicitly requested by default. Use `-Encrypt` to request an
+encrypted connection. Use `-TrustServerCertificate` only when permitted by your
+security policy because it bypasses certificate-chain validation.
+
+### Permissions required in SQL Server
+
+Local administrator rights on the Windows host do not automatically grant SQL
+Server access. The selected Windows or SQL identity must be configured as a
+login separately on every SQL Server instance being inventoried.
+
+The account needs enough permission to:
+
+- Connect to the instance and the databases being measured.
+- Enumerate databases.
+- read database file metadata and `FILEPROPERTY(..., 'SpaceUsed')`.
+- Run `DBCC SQLPERF(LOGSPACE)`.
+
+Use a dedicated least-privilege account where possible. A DBA should review and
+run the following examples on each target instance. Do not grant `sysadmin`
+merely to make the inventory work.
+
+#### Grant access to a Windows account
+
+Replace `CONTOSO\SqlInventory` with the domain account that will run the
+PowerShell script:
+
+```sql
+USE [master];
+GO
+CREATE LOGIN [CONTOSO\SqlInventory] FROM WINDOWS;
+GO
+GRANT VIEW ANY DATABASE TO [CONTOSO\SqlInventory];
+GRANT CONNECT ANY DATABASE TO [CONTOSO\SqlInventory];
+GO
+```
+
+`CONNECT ANY DATABASE` is available in SQL Server 2014 and newer. On older
+versions, or where policy does not permit that server-level permission, create a
+database user and grant access separately in every database that should be
+measured:
+
+```sql
+USE [YourDatabase];
+GO
+CREATE USER [CONTOSO\SqlInventory] FOR LOGIN [CONTOSO\SqlInventory];
+GRANT CONNECT TO [CONTOSO\SqlInventory];
+GRANT VIEW DATABASE STATE TO [CONTOSO\SqlInventory];
+GO
+```
+
+Repeat that database-level block for each included user and system database.
+If the user already exists, omit the relevant `CREATE USER` statement.
+
+`DBCC SQLPERF(LOGSPACE)` also needs a server-state permission. Use the statement
+appropriate for the SQL Server version:
+
+```sql
+-- SQL Server 2019 and earlier
+GRANT VIEW SERVER STATE TO [CONTOSO\SqlInventory];
+GO
+
+-- SQL Server 2022 and later
+GRANT VIEW SERVER PERFORMANCE STATE TO [CONTOSO\SqlInventory];
+GO
+```
+
+Run only the version-appropriate grant, unless your DBA determines both are
+required for the versions and security policy in the estate.
+
+#### Create and grant access to a SQL login
+
+SQL authentication requires SQL Server mixed mode to be enabled. A DBA can
+create a dedicated SQL login using the organization's password-management
+process:
+
+```sql
+USE [master];
+GO
+CREATE LOGIN [SqlStorageInventory]
+WITH PASSWORD = 'ReplaceWithAStrongManagedPassword',
+     CHECK_POLICY = ON,
+     CHECK_EXPIRATION = ON;
+GO
+GRANT VIEW ANY DATABASE TO [SqlStorageInventory];
+GRANT CONNECT ANY DATABASE TO [SqlStorageInventory];
+GO
+```
+
+Grant the same version-appropriate server-state permission shown above, replacing
+`[CONTOSO\SqlInventory]` with `[SqlStorageInventory]`. Where database-level users
+are required, create one in every database being measured:
+
+```sql
+USE [YourDatabase];
+GO
+CREATE USER [SqlStorageInventory] FOR LOGIN [SqlStorageInventory];
+GRANT CONNECT TO [SqlStorageInventory];
+GRANT VIEW DATABASE STATE TO [SqlStorageInventory];
+GO
+```
+
+Never place the SQL password in this repository, a script, a CSV, command
+history, or the diagnostic file.
+
+### Run the inventory
+
+After producing one or both discovery CSV files, copy the inventory script and
+CSV files to an authorised member server. Run it with the current Windows
+identity:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 `
+    -InputCsv '.\SQL-Discovery-DomainController.csv',
+              '.\SQL-Discovery-MemberServer.csv'
+```
+
+The script deduplicates instances present in both files. Actual used storage
+includes occupied data pages and used transaction-log space. System databases
+are included unless `-ExcludeSystemDatabases` is supplied:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 -ExcludeSystemDatabases
+```
+
+For SQL authentication, obtain the password through a secure interactive prompt
+using either prompt mode:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 -AuthMode Prompt
+```
+
+Or create a credential object and supply it directly. An explicit credential
+overrides `-AuthMode`:
+
+```powershell
+$credential = Get-Credential
+.\SQL-Database-Storage-Inventory.ps1 -Credential $credential
+```
+
+To request encryption:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 -Encrypt
+```
+
+If an authorised test environment uses a certificate that the member server
+does not trust, and policy permits bypassing certificate validation:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 -Encrypt -TrustServerCertificate
+```
+
+### Inventory parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-InputCsv` | Both standard discovery CSV names | One or more discovery CSV files |
+| `-OutputCsv` | `.\SQL-Database-Storage-Inventory.csv` | Results CSV containing every instance and its status |
+| `-DiagnosticLog` | `.\SQL-Database-Storage-Inventory-Diagnostics.txt` | Append-only error details; created or modified only when a warning or error occurs |
+| `-AuthMode` | `CurrentUser` | Uses the current Windows identity, or securely prompts for a SQL login when set to `Prompt` |
+| `-Credential` | None | Uses a supplied SQL-login `PSCredential` and takes precedence over `-AuthMode`; `-SqlCredential` is retained as an alias |
+| `-ExcludeSystemDatabases` | Off | Excludes `master`, `model`, `msdb`, and `tempdb` |
+| `-ConnectionTimeoutSeconds` | `10` | SQL connection timeout per instance |
+| `-CommandTimeoutSeconds` | `30` | SQL command timeout per query |
+| `-Encrypt` | Off | Requests SQL transport encryption |
+| `-TrustServerCertificate` | Off | Bypasses certificate-chain validation when encryption is used |
+
+### Results and diagnostics
+
+The default report is written to
+`.\SQL-Database-Storage-Inventory.csv`. Instances or databases that cannot be
+queried remain in the report with `FAILED` or `PARTIAL` status.
+
+Detailed diagnostics are appended to
+`.\SQL-Database-Storage-Inventory-Diagnostics.txt` by default. Console warnings
+include diagnostic IDs that identify the matching text-file entries. Error
+details are not written to the inventory CSV. The text file is created or
+appended only when at least one warning or error occurs; a fully successful run
+does not create or modify it. Use
+`-DiagnosticLog 'C:\Reports\SQL-Storage-Diagnostics.txt'` to select a different
+location. The text file includes timestamps, exception and inner-exception
+details, PowerShell and .NET stack traces, SQL error numbers, operation context,
+the executing identity, and the input and output paths. Processing continues
+after individual server or database failures, and every discovered instance
+remains in the CSV with its `OK`, `PARTIAL`, or `FAILED` status.
 
 ## Requirements
 
