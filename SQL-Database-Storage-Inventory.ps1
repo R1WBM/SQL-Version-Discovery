@@ -7,27 +7,52 @@
  Copyright: Copyright (C) 2026 Russell McKee
  SPDX-License-Identifier: GPL-3.0-only
  LinkedIn : https://www.linkedin.com/in/russellwbmckee/
- Version  : 1.3
- Updated  : 2 October 2026
+ Version  : 2.3
+ Updated  : 7 October 2026
 
 .SYNOPSIS
-    Reports database counts and actual used database storage for SQL Server
-    instances listed in the SQL Server Discovery Toolkit CSV outputs.
+    Expands discovered SQL Server hosts into individual instances, then reports
+    SQL-visible vCore counts, database counts, and actual used database storage
+    for every instance.
 
 .DESCRIPTION
     Imports one or more CSV files produced by SQL-Discovery-DomainController.ps1
-    or SQL-Discovery-MemberServer.ps1, deduplicates the discovered instances,
-    and connects to each instance from a Windows member server.
+    or SQL-Discovery-MemberServer.ps1 and deduplicates the discovered hosts.
+    The inventory then expands each host into instances using SQL Browser plus
+    Windows SQL Database Engine services and the remote registry. It connects
+    to every resulting instance from a Windows member server.
 
     By default, connections use Windows integrated authentication with the
     identity running PowerShell. Set -AuthMode Prompt or supply -Credential
     when SQL Server authentication is required. An explicitly supplied
     credential takes precedence over -AuthMode.
 
+    Windows instance discovery has separate authentication controls:
+      CurrentUser : use the Windows identity running PowerShell (default).
+      Prompt      : securely prompt for a Windows discovery credential.
+      BrowserOnly : skip authenticated WMI/registry discovery and use only SQL
+                    Browser plus instances already present in the input CSVs.
+
+    Supply -DiscoveryCredential for non-interactive WMI/registry discovery.
+    SQL Browser does not require authentication.
+
     Actual data usage is calculated from FILEPROPERTY(name, 'SpaceUsed') for
     every accessible online database. Actual transaction-log usage is obtained
     from DBCC SQLPERF(LOGSPACE). Results include system databases unless
     -ExcludeSystemDatabases is specified.
+
+    SQLVCoreCount is the number of VISIBLE ONLINE SQL Server schedulers. It
+    represents the logical processors currently available to the SQL Database
+    Engine and is intended as an initial target-estate sizing input. It is not
+    by itself a complete physical-core licensing assessment.
+
+    Each expanded SQL Server instance is inventoried separately.
+    MultipleSQLInstances is Yes when more than one instance is found on the
+    same server and No otherwise. SQLTcpPort records a port resolved from the
+    input CSV, SQL Browser, or the instance's Windows registry configuration.
+    Service state and enabled network protocols are exported. An instance with
+    both TCP/IP and Named Pipes disabled is reported as NOT CONNECTABLE rather
+    than generating a misleading SQL connection failure.
 
 .PARAMETER InputCsv
     One or more discovery CSV paths. By default, the script looks for both
@@ -51,6 +76,20 @@
     Optional SQL Server authentication credential supplied directly. It takes
     precedence over -AuthMode. -SqlCredential remains available as an alias.
     This does not impersonate an alternate Windows account.
+
+.PARAMETER InstanceDiscoveryAuthMode
+    CurrentUser : use the current Windows identity for WMI/registry discovery
+                  (default).
+    Prompt      : securely prompt for a Windows credential.
+    BrowserOnly : do not use WMI/registry; use SQL Browser and CSV rows only.
+
+.PARAMETER DiscoveryCredential
+    Optional Windows credential for WMI/registry instance discovery. It takes
+    precedence over InstanceDiscoveryAuthMode. This credential is never used
+    for SQL Server connections.
+
+.PARAMETER InstanceDiscoveryTimeoutMs
+    SQL Browser UDP response timeout in milliseconds for each discovered host.
 
 .PARAMETER ExcludeSystemDatabases
     Excludes master, model, msdb and tempdb from the count and storage totals.
@@ -84,15 +123,38 @@
 .EXAMPLE
     .\SQL-Database-Storage-Inventory.ps1 -AuthMode Prompt
 
+.EXAMPLE
+    .\SQL-Database-Storage-Inventory.ps1 `
+        -InstanceDiscoveryAuthMode Prompt `
+        -AuthMode CurrentUser
+
+.EXAMPLE
+    $windowsCredential = Get-Credential -Message 'Windows discovery account'
+    $sqlCredential = Get-Credential -Message 'SQL login'
+    .\SQL-Database-Storage-Inventory.ps1 `
+        -DiscoveryCredential $windowsCredential `
+        -Credential $sqlCredential
+
+.EXAMPLE
+    .\SQL-Database-Storage-Inventory.ps1 `
+        -InstanceDiscoveryAuthMode BrowserOnly
+
 .NOTES
     REQUIREMENTS
       - Windows PowerShell 5.1 or PowerShell 7.
       - Network access to every discovered SQL Server endpoint.
       - A login that can connect to each database to be measured.
+      - For complete instance expansion, local administrator or equivalent WMI
+        and remote-registry access on discovered Windows hosts.
+      - WMI / RPC access to targets, or UDP 1434 for BrowserOnly discovery.
       - Permission to run DBCC SQLPERF(LOGSPACE).
+      - VIEW SERVER STATE permission to read SQL-visible vCores on SQL Server
+        2019 and earlier, or VIEW SERVER PERFORMANCE STATE on SQL Server 2022
+        and later.
 
-    Failed instances remain in the output CSV with FAILED status. Detailed
-    errors are appended to the diagnostic text file only when errors occur.
+    Failed, stopped, and non-connectable instances remain in the output CSV.
+    Detailed errors and connectivity warnings are appended to the diagnostic
+    text file only when they occur.
 
  -------------------------------------------------------------------------------
  DISCLAIMER - PLEASE READ BEFORE RUNNING
@@ -137,6 +199,16 @@ param(
     [System.Management.Automation.PSCredential]
     $Credential = [System.Management.Automation.PSCredential]::Empty,
 
+    [ValidateSet('CurrentUser', 'Prompt', 'BrowserOnly')]
+    [string] $InstanceDiscoveryAuthMode = 'CurrentUser',
+
+    [Alias('WindowsCredential', 'InstanceDiscoveryCredential')]
+    [System.Management.Automation.PSCredential]
+    $DiscoveryCredential = [System.Management.Automation.PSCredential]::Empty,
+
+    [ValidateRange(100, 10000)]
+    [int] $InstanceDiscoveryTimeoutMs = 1000,
+
     [switch] $ExcludeSystemDatabases,
 
     [ValidateRange(1, 300)]
@@ -157,11 +229,41 @@ if ($Credential -eq [System.Management.Automation.PSCredential]::Empty) {
     $Credential = $null
 }
 
+if ($DiscoveryCredential -eq [System.Management.Automation.PSCredential]::Empty) {
+    $DiscoveryCredential = $null
+}
+
 if ($AuthMode -eq 'Prompt' -and -not $Credential) {
     $Credential = Get-Credential -Message 'Enter a SQL Server login and password for the storage inventory'
     if (-not $Credential) {
         throw 'Credential prompt was cancelled. No inventory was performed.'
     }
+}
+
+if ($InstanceDiscoveryAuthMode -eq 'BrowserOnly' -and $DiscoveryCredential) {
+    throw 'DiscoveryCredential cannot be used with InstanceDiscoveryAuthMode BrowserOnly.'
+}
+
+if ($InstanceDiscoveryAuthMode -eq 'Prompt' -and -not $DiscoveryCredential) {
+    $DiscoveryCredential = Get-Credential -Message 'Enter a Windows credential for SQL instance discovery'
+    if (-not $DiscoveryCredential) {
+        throw 'Windows discovery credential prompt was cancelled. No inventory was performed.'
+    }
+}
+
+$VersionMap = @{
+    '6'  = 'SQL Server 6.0 / 6.5'
+    '7'  = 'SQL Server 7.0'
+    '8'  = 'SQL Server 2000'
+    '9'  = 'SQL Server 2005'
+    '10' = 'SQL Server 2008 / 2008 R2'
+    '11' = 'SQL Server 2012'
+    '12' = 'SQL Server 2014'
+    '13' = 'SQL Server 2016'
+    '14' = 'SQL Server 2017'
+    '15' = 'SQL Server 2019'
+    '16' = 'SQL Server 2022'
+    '17' = 'SQL Server 2025'
 }
 
 function Get-PropertyValue {
@@ -175,19 +277,35 @@ function Get-PropertyValue {
     return ''
 }
 
+function Get-SqlRelease {
+    param([string] $Version)
+
+    if ([string]::IsNullOrWhiteSpace($Version)) { return 'Unknown' }
+    $major = ($Version -split '\.')[0]
+    if ($VersionMap.ContainsKey($major)) { return $VersionMap[$major] }
+    return "Unrecognised (major build $major)"
+}
+
+function Get-DiscoveryHostName {
+    param([psobject] $DiscoveryRow)
+
+    $hostName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'FQDN'
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        $hostName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'ServerName'
+    }
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        $hostName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'IPAddress'
+    }
+    return $hostName
+}
+
 function Get-SqlDataSource {
     param([psobject] $DiscoveryRow)
 
-    $fqdn = Get-PropertyValue -InputObject $DiscoveryRow -Name 'FQDN'
-    $serverName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'ServerName'
-    $ipAddress = Get-PropertyValue -InputObject $DiscoveryRow -Name 'IPAddress'
+    $hostName = Get-DiscoveryHostName -DiscoveryRow $DiscoveryRow
     $instanceName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'InstanceName'
     $detectedBy = Get-PropertyValue -InputObject $DiscoveryRow -Name 'DetectedBy'
     $spns = Get-PropertyValue -InputObject $DiscoveryRow -Name 'ServicePrincipalName'
-
-    $hostName = $fqdn
-    if ([string]::IsNullOrWhiteSpace($hostName)) { $hostName = $serverName }
-    if ([string]::IsNullOrWhiteSpace($hostName)) { $hostName = $ipAddress }
 
     if ([string]::IsNullOrWhiteSpace($hostName) -or
         [string]::IsNullOrWhiteSpace($instanceName) -or
@@ -212,19 +330,441 @@ function Get-SqlDataSource {
     return $hostName
 }
 
-function Get-InstanceKey {
+function Get-DiscoveryTcpPort {
+    param([psobject] $DiscoveryRow)
+
+    $detectedBy = Get-PropertyValue -InputObject $DiscoveryRow -Name 'DetectedBy'
+    if ($detectedBy -match '(?i)\bTCP port\s+(?<Port>\d{1,5})\b') {
+        return Get-ValidSqlTcpPort -Value $Matches.Port
+    }
+
+    $spns = Get-PropertyValue -InputObject $DiscoveryRow -Name 'ServicePrincipalName'
+    foreach ($spn in ($spns -split '\s*;\s*')) {
+        if ($spn -match '(?i)^MSSQLSvc/[^:]+:(?<Port>\d{1,5})$') {
+            return Get-ValidSqlTcpPort -Value $Matches.Port
+        }
+    }
+
+    return ''
+}
+
+function Get-ServerKey {
     param([psobject] $DiscoveryRow)
 
     $serverName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'ServerName'
     $fqdn = Get-PropertyValue -InputObject $DiscoveryRow -Name 'FQDN'
     $ipAddress = Get-PropertyValue -InputObject $DiscoveryRow -Name 'IPAddress'
-    $instanceName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'InstanceName'
 
     $hostIdentity = $serverName
     if ([string]::IsNullOrWhiteSpace($hostIdentity)) { $hostIdentity = $fqdn }
     if ([string]::IsNullOrWhiteSpace($hostIdentity)) { $hostIdentity = $ipAddress }
 
-    return ('{0}|{1}' -f $hostIdentity.Trim(), $instanceName.Trim())
+    if ([string]::IsNullOrWhiteSpace($hostIdentity)) { return $null }
+    return $hostIdentity.Trim()
+}
+
+function Get-InstanceKey {
+    param([psobject] $DiscoveryRow)
+
+    $serverKey = Get-ServerKey -DiscoveryRow $DiscoveryRow
+    $instanceName = Get-PropertyValue -InputObject $DiscoveryRow -Name 'InstanceName'
+
+    return ('{0}|{1}' -f $serverKey, $instanceName.Trim())
+}
+
+function New-ExpandedSqlDataSource {
+    param(
+        [psobject] $DiscoveryRow,
+        [string] $InstanceName,
+        [string] $TcpPort
+    )
+
+    $hostName = Get-DiscoveryHostName -DiscoveryRow $DiscoveryRow
+    if ([string]::IsNullOrWhiteSpace($hostName)) { return $null }
+
+    if (-not [string]::IsNullOrWhiteSpace($TcpPort)) {
+        return "tcp:$hostName,$TcpPort"
+    }
+
+    if ($InstanceName -eq 'MSSQLSERVER') { return $hostName }
+    return "$hostName\$InstanceName"
+}
+
+function ConvertFrom-SqlBrowserResponse {
+    param([string] $RawResponse)
+
+    $instances = [ordered]@{}
+    if ([string]::IsNullOrWhiteSpace($RawResponse)) { return @() }
+
+    foreach ($block in ($RawResponse -split ';;')) {
+        $tokens = @($block.Trim(';') -split ';')
+        $values = @{}
+        for ($i = 0; $i + 1 -lt $tokens.Count; $i += 2) {
+            if (-not [string]::IsNullOrWhiteSpace($tokens[$i])) {
+                $values[$tokens[$i]] = $tokens[$i + 1]
+            }
+        }
+
+        $instanceName = [string] $values['InstanceName']
+        if ([string]::IsNullOrWhiteSpace($instanceName) -or $instances.Contains($instanceName)) {
+            continue
+        }
+
+        $tcpPort = [string] $values['tcp']
+        if ($tcpPort -notmatch '^\d{1,5}$' -or [int] $tcpPort -gt 65535) {
+            $tcpPort = ''
+        }
+
+        $instances[$instanceName] = [pscustomobject]@{
+            InstanceName = $instanceName
+            TcpPort      = $tcpPort
+        }
+    }
+
+    return @($instances.Values)
+}
+
+function Get-SqlBrowserInstances {
+    param(
+        [string] $HostName,
+        [int] $TimeoutMs
+    )
+
+    $udp = $null
+    try {
+        $udp = [System.Net.Sockets.UdpClient]::new()
+        $udp.Client.ReceiveTimeout = $TimeoutMs
+        $udp.Client.SendTimeout = $TimeoutMs
+        [void] $udp.Send([byte[]](0x02), 1, $HostName, 1434)
+        $remote = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+        $data = $udp.Receive([ref] $remote)
+        if ($data.Length -le 3) { return @() }
+
+        $rawResponse = [Text.Encoding]::ASCII.GetString($data, 3, $data.Length - 3)
+        return @(ConvertFrom-SqlBrowserResponse -RawResponse $rawResponse)
+    }
+    catch {
+        return @()
+    }
+    finally {
+        if ($udp) { $udp.Close() }
+    }
+}
+
+function Get-RemoteRegString {
+    param($CimSession, [string] $SubKey, [string] $ValueName)
+
+    $result = Invoke-CimMethod -CimSession $CimSession -Namespace 'root/cimv2' `
+        -ClassName 'StdRegProv' -MethodName 'GetStringValue' `
+        -Arguments @{ hDefKey = [uint32] 2147483650; sSubKeyName = $SubKey; sValueName = $ValueName } `
+        -ErrorAction Stop
+    if ($result -and $result.ReturnValue -eq 0) { return $result.sValue }
+    return $null
+}
+
+function Get-RemoteRegValueNames {
+    param($CimSession, [string] $SubKey)
+
+    $result = Invoke-CimMethod -CimSession $CimSession -Namespace 'root/cimv2' `
+        -ClassName 'StdRegProv' -MethodName 'EnumValues' `
+        -Arguments @{ hDefKey = [uint32] 2147483650; sSubKeyName = $SubKey } `
+        -ErrorAction Stop
+    if ($result -and $result.ReturnValue -eq 0 -and $result.sNames) {
+        return @($result.sNames)
+    }
+    return @()
+}
+
+function Get-RemoteRegSubKeyNames {
+    param($CimSession, [string] $SubKey)
+
+    $result = Invoke-CimMethod -CimSession $CimSession -Namespace 'root/cimv2' `
+        -ClassName 'StdRegProv' -MethodName 'EnumKey' `
+        -Arguments @{ hDefKey = [uint32] 2147483650; sSubKeyName = $SubKey } `
+        -ErrorAction Stop
+    if ($result -and $result.ReturnValue -eq 0 -and $result.sNames) {
+        return @($result.sNames)
+    }
+    return @()
+}
+
+function Get-RemoteRegDword {
+    param($CimSession, [string] $SubKey, [string] $ValueName)
+
+    $result = Invoke-CimMethod -CimSession $CimSession -Namespace 'root/cimv2' `
+        -ClassName 'StdRegProv' -MethodName 'GetDWORDValue' `
+        -Arguments @{ hDefKey = [uint32] 2147483650; sSubKeyName = $SubKey; sValueName = $ValueName } `
+        -ErrorAction Stop
+    if ($result -and $result.ReturnValue -eq 0) {
+        return [int] $result.uValue
+    }
+    return $null
+}
+
+function Get-ValidSqlTcpPort {
+    param([string] $Value)
+
+    foreach ($candidate in ($Value -split '[,;\s]+')) {
+        if ($candidate -match '^\d{1,5}$') {
+            $port = [int] $candidate
+            if ($port -ge 1 -and $port -le 65535) {
+                return [string] $port
+            }
+        }
+    }
+    return ''
+}
+
+function Get-SqlInstanceTcpPort {
+    param(
+        $CimSession,
+        [string] $InstanceKey
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstanceKey)) { return '' }
+
+    foreach ($root in @(
+            "SOFTWARE\Microsoft\Microsoft SQL Server\$InstanceKey\MSSQLServer\SuperSocketNetLib\Tcp",
+            "SOFTWARE\Wow6432Node\Microsoft\Microsoft SQL Server\$InstanceKey\MSSQLServer\SuperSocketNetLib\Tcp"
+        )) {
+        $networkKeys = [System.Collections.Generic.List[string]]::new()
+        $networkKeys.Add("$root\IPAll")
+        $networkKeys.Add($root)
+        foreach ($subKey in (Get-RemoteRegSubKeyNames -CimSession $CimSession -SubKey $root)) {
+            if ($subKey -ne 'IPAll') {
+                $networkKeys.Add("$root\$subKey")
+            }
+        }
+
+        foreach ($networkKey in $networkKeys) {
+            foreach ($valueName in 'TcpPort', 'TcpDynamicPorts') {
+                $port = Get-ValidSqlTcpPort -Value (
+                    Get-RemoteRegString -CimSession $CimSession `
+                        -SubKey $networkKey -ValueName $valueName
+                )
+                if ($port) { return $port }
+            }
+        }
+    }
+
+    return ''
+}
+
+function Get-SqlInstanceProtocolConfiguration {
+    param(
+        $CimSession,
+        [string] $InstanceKey,
+        [string] $InstanceName
+    )
+
+    $configuration = [ordered]@{
+        TcpEnabled        = $null
+        NamedPipesEnabled = $null
+        NamedPipe         = ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($InstanceKey)) {
+        return [pscustomobject] $configuration
+    }
+
+    foreach ($root in @(
+            "SOFTWARE\Microsoft\Microsoft SQL Server\$InstanceKey\MSSQLServer\SuperSocketNetLib",
+            "SOFTWARE\Wow6432Node\Microsoft\Microsoft SQL Server\$InstanceKey\MSSQLServer\SuperSocketNetLib"
+        )) {
+        if ($null -eq $configuration.TcpEnabled) {
+            $configuration.TcpEnabled = Get-RemoteRegDword -CimSession $CimSession `
+                -SubKey "$root\Tcp" -ValueName 'Enabled'
+        }
+        if ($null -eq $configuration.NamedPipesEnabled) {
+            $configuration.NamedPipesEnabled = Get-RemoteRegDword -CimSession $CimSession `
+                -SubKey "$root\Np" -ValueName 'Enabled'
+        }
+        if ([string]::IsNullOrWhiteSpace($configuration.NamedPipe)) {
+            $configuration.NamedPipe = [string] (
+                Get-RemoteRegString -CimSession $CimSession `
+                    -SubKey "$root\Np" -ValueName 'PipeName'
+            )
+        }
+    }
+
+    if ($configuration.NamedPipesEnabled -eq 1 -and
+        [string]::IsNullOrWhiteSpace($configuration.NamedPipe)) {
+        $configuration.NamedPipe = if ($InstanceName -eq 'MSSQLSERVER') {
+            '\\.\pipe\sql\query'
+        }
+        else {
+            "\\.\pipe\MSSQL`$$InstanceName\sql\query"
+        }
+    }
+
+    return [pscustomobject] $configuration
+}
+
+function Get-SqlInstanceKeyFromServicePath {
+    param([string] $PathName)
+
+    if ($PathName -match '(?i)\\(?<InstanceKey>MSSQL\d+\.[^\\"]+)\\MSSQL\\Binn\\sqlservr\.exe') {
+        return $Matches.InstanceKey
+    }
+    return ''
+}
+
+function New-RemoteNamedPipeDataSource {
+    param(
+        [psobject] $DiscoveryRow,
+        [string] $PipeName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PipeName)) { return $null }
+    $hostName = Get-DiscoveryHostName -DiscoveryRow $DiscoveryRow
+    if ([string]::IsNullOrWhiteSpace($hostName)) { return $null }
+
+    $pipePath = $PipeName.Trim()
+    if ($pipePath -match '^\\\\\.\\(?<Path>.+)$') {
+        $pipePath = $Matches.Path
+    }
+    elseif ($pipePath -match '^\\\\[^\\]+\\(?<Path>.+)$') {
+        $pipePath = $Matches.Path
+    }
+    elseif ($pipePath -notmatch '(?i)^pipe\\') {
+        $pipePath = "pipe\$pipePath"
+    }
+
+    return "np:\\$hostName\$pipePath"
+}
+
+function Get-SqlServiceListeningTcpPorts {
+    param(
+        $CimSession,
+        [uint32] $ProcessId
+    )
+
+    if ($ProcessId -eq 0) { return @() }
+
+    try {
+        $connections = Get-CimInstance -CimSession $CimSession `
+            -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetTCPConnection' `
+            -Filter "OwningProcess = $ProcessId AND State = 2" -ErrorAction Stop
+    }
+    catch {
+        return @()
+    }
+
+    $ports = @(
+        $connections |
+        Where-Object { $_.LocalAddress -notin @('127.0.0.1', '::1') } |
+        ForEach-Object { Get-ValidSqlTcpPort -Value ([string] $_.LocalPort) } |
+        Where-Object { $_ } |
+        Group-Object |
+        Sort-Object @{ Expression = 'Count'; Descending = $true },
+                    @{ Expression = { [int] $_.Name }; Ascending = $true } |
+        ForEach-Object { $_.Name }
+    )
+    return $ports
+}
+
+function New-InstanceDiscoverySession {
+    param(
+        [string] $ComputerName,
+        [System.Management.Automation.PSCredential] $WindowsCredential
+    )
+
+    $parameters = @{ ComputerName = $ComputerName; ErrorAction = 'Stop' }
+    if ($WindowsCredential) { $parameters['Credential'] = $WindowsCredential }
+
+    try {
+        return New-CimSession @parameters
+    }
+    catch {
+        $parameters['SessionOption'] = New-CimSessionOption -Protocol Dcom
+        return New-CimSession @parameters
+    }
+}
+
+function Get-WindowsSqlInstances {
+    param($CimSession)
+
+    $instances = [ordered]@{}
+    foreach ($root in @(
+            'SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL',
+            'SOFTWARE\Wow6432Node\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+        )) {
+        foreach ($name in (Get-RemoteRegValueNames -CimSession $CimSession -SubKey $root)) {
+            if ($instances.Contains($name)) { continue }
+            $instanceKey = Get-RemoteRegString -CimSession $CimSession -SubKey $root -ValueName $name
+            if ($instanceKey) {
+                $ports = [System.Collections.Generic.List[string]]::new()
+                $namedPipes = [System.Collections.Generic.List[string]]::new()
+                $registryPort = Get-SqlInstanceTcpPort -CimSession $CimSession `
+                    -InstanceKey $instanceKey
+                if ($registryPort) { $ports.Add($registryPort) }
+                $protocols = Get-SqlInstanceProtocolConfiguration -CimSession $CimSession `
+                    -InstanceKey $instanceKey -InstanceName $name
+                if ($protocols.NamedPipesEnabled -eq 1 -and $protocols.NamedPipe) {
+                    $namedPipes.Add($protocols.NamedPipe)
+                }
+                $instances[$name] = [pscustomobject]@{
+                    InstanceKey      = $instanceKey
+                    TcpPorts         = $ports
+                    NamedPipes       = $namedPipes
+                    ConfiguredNamedPipe = $protocols.NamedPipe
+                    TcpEnabled       = $protocols.TcpEnabled
+                    NamedPipesEnabled = $protocols.NamedPipesEnabled
+                    ServiceState     = ''
+                    ServiceStartMode = ''
+                }
+            }
+        }
+    }
+
+    $services = Get-CimInstance -CimSession $CimSession -ClassName Win32_Service `
+        -Filter "Name = 'MSSQLSERVER' OR Name LIKE 'MSSQL$%'" -ErrorAction Stop
+    foreach ($service in @($services)) {
+        $instanceName = if ($service.Name -eq 'MSSQLSERVER') {
+            'MSSQLSERVER'
+        }
+        elseif ($service.Name -like 'MSSQL$*') {
+            $service.Name.Substring(6)
+        }
+        else {
+            continue
+        }
+
+        $serviceInstanceKey = Get-SqlInstanceKeyFromServicePath -PathName $service.PathName
+        if (-not $instances.Contains($instanceName)) {
+            $ports = [System.Collections.Generic.List[string]]::new()
+            $namedPipes = [System.Collections.Generic.List[string]]::new()
+            $protocols = Get-SqlInstanceProtocolConfiguration -CimSession $CimSession `
+                -InstanceKey $serviceInstanceKey -InstanceName $instanceName
+            $registryPort = Get-SqlInstanceTcpPort -CimSession $CimSession `
+                -InstanceKey $serviceInstanceKey
+            if ($registryPort) { $ports.Add($registryPort) }
+            if ($protocols.NamedPipesEnabled -eq 1 -and $protocols.NamedPipe) {
+                $namedPipes.Add($protocols.NamedPipe)
+            }
+            $instances[$instanceName] = [pscustomobject]@{
+                InstanceKey      = $serviceInstanceKey
+                TcpPorts         = $ports
+                NamedPipes       = $namedPipes
+                ConfiguredNamedPipe = $protocols.NamedPipe
+                TcpEnabled       = $protocols.TcpEnabled
+                NamedPipesEnabled = $protocols.NamedPipesEnabled
+                ServiceState     = ''
+                ServiceStartMode = ''
+            }
+        }
+
+        $instances[$instanceName].ServiceState = [string] $service.State
+        $instances[$instanceName].ServiceStartMode = [string] $service.StartMode
+        foreach ($port in @(Get-SqlServiceListeningTcpPorts -CimSession $CimSession `
+                -ProcessId ([uint32] $service.ProcessId))) {
+            if (-not $instances[$instanceName].TcpPorts.Contains($port)) {
+                $instances[$instanceName].TcpPorts.Add($port)
+            }
+        }
+    }
+
+    return $instances
 }
 
 function New-SqlConnectionString {
@@ -392,32 +932,218 @@ if ($loadedFiles.Count -eq 0) {
     throw 'None of the supplied discovery CSV files could be found.'
 }
 
-$instances = @{}
+$servers = @{}
 $skippedRows = 0
 
 foreach ($row in $inputRows) {
-    $dataSource = Get-SqlDataSource -DiscoveryRow $row
-    if (-not $dataSource) {
+    $serverKey = Get-ServerKey -DiscoveryRow $row
+    if ([string]::IsNullOrWhiteSpace($serverKey)) {
         $skippedRows++
         continue
     }
 
-    $key = Get-InstanceKey -DiscoveryRow $row
-    if (-not $instances.ContainsKey($key) -or
-        ($dataSource -like 'tcp:*,*' -and $instances[$key].DataSource -notlike 'tcp:*,*')) {
+    if (-not $servers.ContainsKey($serverKey)) {
+        $servers[$serverKey] = [pscustomobject]@{
+            ServerKey = $serverKey
+            Rows      = [System.Collections.Generic.List[object]]::new()
+        }
+    }
+    $servers[$serverKey].Rows.Add($row)
+}
+
+if ($servers.Count -eq 0) {
+    throw 'No SQL Server hosts were present in the discovery CSV files.'
+}
+
+$instances = @{}
+foreach ($server in ($servers.Values | Sort-Object ServerKey)) {
+    $baseRow = $server.Rows[0]
+    $hostName = Get-DiscoveryHostName -DiscoveryRow $baseRow
+    $candidates = [ordered]@{}
+
+    foreach ($row in $server.Rows) {
+        $instanceName = Get-PropertyValue -InputObject $row -Name 'InstanceName'
+        if ([string]::IsNullOrWhiteSpace($instanceName) -or $instanceName -like '(*') {
+            continue
+        }
+
+        if (-not $candidates.Contains($instanceName)) {
+            $candidates[$instanceName] = [pscustomobject]@{
+                DiscoveryRow = $row
+                InstanceName = $instanceName
+                TcpPorts     = [System.Collections.Generic.List[string]]::new()
+                NamedPipes   = [System.Collections.Generic.List[string]]::new()
+                InstanceKey  = ''
+                ConfiguredNamedPipe = ''
+                TcpEnabled   = $null
+                NamedPipesEnabled = $null
+                ServiceState = ''
+                ServiceStartMode = ''
+                Sources      = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        $csvPort = Get-DiscoveryTcpPort -DiscoveryRow $row
+        if ($csvPort -and -not $candidates[$instanceName].TcpPorts.Contains($csvPort)) {
+            $candidates[$instanceName].TcpPorts.Add($csvPort)
+        }
+        if (-not $candidates[$instanceName].Sources.Contains('Input CSV')) {
+            $candidates[$instanceName].Sources.Add('Input CSV')
+        }
+    }
+
+    foreach ($browserInstance in @(Get-SqlBrowserInstances -HostName $hostName `
+            -TimeoutMs $InstanceDiscoveryTimeoutMs)) {
+        $instanceName = $browserInstance.InstanceName
+        if (-not $candidates.Contains($instanceName)) {
+            $candidates[$instanceName] = [pscustomobject]@{
+                DiscoveryRow = $baseRow
+                InstanceName = $instanceName
+                TcpPorts     = [System.Collections.Generic.List[string]]::new()
+                NamedPipes   = [System.Collections.Generic.List[string]]::new()
+                InstanceKey  = ''
+                ConfiguredNamedPipe = ''
+                TcpEnabled   = $null
+                NamedPipesEnabled = $null
+                ServiceState = ''
+                ServiceStartMode = ''
+                Sources      = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($browserInstance.TcpPort) -and
+            -not $candidates[$instanceName].TcpPorts.Contains($browserInstance.TcpPort)) {
+            $candidates[$instanceName].TcpPorts.Add($browserInstance.TcpPort)
+        }
+        if (-not $candidates[$instanceName].Sources.Contains('SQL Browser')) {
+            $candidates[$instanceName].Sources.Add('SQL Browser')
+        }
+    }
+
+    if ($InstanceDiscoveryAuthMode -ne 'BrowserOnly') {
+        $session = $null
+        try {
+            $session = New-InstanceDiscoverySession -ComputerName $hostName `
+                -WindowsCredential $DiscoveryCredential
+            $windowsInstances = Get-WindowsSqlInstances -CimSession $session
+            foreach ($instanceName in $windowsInstances.Keys) {
+                $windowsInstance = $windowsInstances[$instanceName]
+                if (-not $candidates.Contains($instanceName)) {
+                    $candidates[$instanceName] = [pscustomobject]@{
+                        DiscoveryRow = $baseRow
+                        InstanceName = $instanceName
+                        TcpPorts     = [System.Collections.Generic.List[string]]::new()
+                        NamedPipes   = [System.Collections.Generic.List[string]]::new()
+                        InstanceKey  = ''
+                        ConfiguredNamedPipe = ''
+                        TcpEnabled   = $null
+                        NamedPipesEnabled = $null
+                        ServiceState = ''
+                        ServiceStartMode = ''
+                        Sources      = [System.Collections.Generic.List[string]]::new()
+                    }
+                }
+                foreach ($port in $windowsInstance.TcpPorts) {
+                    if (-not $candidates[$instanceName].TcpPorts.Contains($port)) {
+                        $candidates[$instanceName].TcpPorts.Add($port)
+                    }
+                }
+                foreach ($pipeName in $windowsInstance.NamedPipes) {
+                    if (-not $candidates[$instanceName].NamedPipes.Contains($pipeName)) {
+                        $candidates[$instanceName].NamedPipes.Add($pipeName)
+                    }
+                }
+                $candidates[$instanceName].InstanceKey = $windowsInstance.InstanceKey
+                $candidates[$instanceName].ConfiguredNamedPipe = $windowsInstance.ConfiguredNamedPipe
+                $candidates[$instanceName].TcpEnabled = $windowsInstance.TcpEnabled
+                $candidates[$instanceName].NamedPipesEnabled = $windowsInstance.NamedPipesEnabled
+                $candidates[$instanceName].ServiceState = $windowsInstance.ServiceState
+                $candidates[$instanceName].ServiceStartMode = $windowsInstance.ServiceStartMode
+                if (-not $candidates[$instanceName].Sources.Contains('Windows service/registry/listener')) {
+                    $candidates[$instanceName].Sources.Add('Windows service/registry/listener')
+                }
+            }
+        }
+        catch {
+            $diagnosticId = Write-Diagnostic -Level WARNING `
+                -Context "Expanding SQL instances on '$hostName'" `
+                -Message 'Windows service/registry discovery failed; CSV and SQL Browser results will still be used.' `
+                -ErrorRecord $_
+            Write-Warning "Windows instance discovery failed on '$hostName'. Diagnostic ID: $diagnosticId. See '$script:DiagnosticLogPath'."
+        }
+        finally {
+            if ($session) {
+                Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    foreach ($candidate in $candidates.Values) {
+        $dataSources = [System.Collections.Generic.List[string]]::new()
+        foreach ($port in $candidate.TcpPorts) {
+            $directDataSource = New-ExpandedSqlDataSource -DiscoveryRow $candidate.DiscoveryRow `
+                -InstanceName $candidate.InstanceName -TcpPort $port
+            if ($directDataSource -and -not $dataSources.Contains($directDataSource)) {
+                $dataSources.Add($directDataSource)
+            }
+        }
+
+        foreach ($pipeName in $candidate.NamedPipes) {
+            $namedPipeDataSource = New-RemoteNamedPipeDataSource `
+                -DiscoveryRow $candidate.DiscoveryRow -PipeName $pipeName
+            if ($namedPipeDataSource -and -not $dataSources.Contains($namedPipeDataSource)) {
+                $dataSources.Add($namedPipeDataSource)
+            }
+        }
+
+        $namedDataSource = New-ExpandedSqlDataSource -DiscoveryRow $candidate.DiscoveryRow `
+            -InstanceName $candidate.InstanceName -TcpPort ''
+        if ($namedDataSource -and -not $dataSources.Contains($namedDataSource)) {
+            $dataSources.Add($namedDataSource)
+        }
+        if ($dataSources.Count -eq 0) { continue }
+
+        $key = '{0}|{1}' -f $server.ServerKey, $candidate.InstanceName
         $instances[$key] = [pscustomobject]@{
-            DiscoveryRow = $row
-            DataSource   = $dataSource
+            DiscoveryRow          = $candidate.DiscoveryRow
+            DataSources           = $dataSources
+            ServerKey             = $server.ServerKey
+            InstanceName          = $candidate.InstanceName
+            TcpPorts              = $candidate.TcpPorts
+            NamedPipes            = $candidate.NamedPipes
+            InstanceKey           = $candidate.InstanceKey
+            ConfiguredNamedPipe   = $candidate.ConfiguredNamedPipe
+            TcpEnabled            = $candidate.TcpEnabled
+            NamedPipesEnabled     = $candidate.NamedPipesEnabled
+            ServiceState          = $candidate.ServiceState
+            ServiceStartMode      = $candidate.ServiceStartMode
+            InstanceDiscoverySource = $candidate.Sources -join '; '
         }
     }
 }
 
 if ($instances.Count -eq 0) {
-    throw 'No connectable SQL Server instances were present in the discovery CSV files.'
+    throw 'No connectable SQL Server instances were found in the discovery CSVs, SQL Browser, or Windows service/registry discovery.'
 }
 
-$authentication = if ($Credential) {
+$instanceCountByServer = @{}
+foreach ($instance in $instances.Values) {
+    if (-not $instanceCountByServer.ContainsKey($instance.ServerKey)) {
+        $instanceCountByServer[$instance.ServerKey] = 0
+    }
+    $instanceCountByServer[$instance.ServerKey]++
+}
+
+$sqlAuthentication = if ($Credential) {
     "SQL credential ($($Credential.UserName))"
+}
+else {
+    "Current Windows user ($([Security.Principal.WindowsIdentity]::GetCurrent().Name))"
+}
+
+$discoveryAuthentication = if ($InstanceDiscoveryAuthMode -eq 'BrowserOnly') {
+    'BrowserOnly (no Windows authentication)'
+}
+elseif ($DiscoveryCredential) {
+    "Windows credential ($($DiscoveryCredential.UserName))"
 }
 else {
     "Current Windows user ($([Security.Principal.WindowsIdentity]::GetCurrent().Name))"
@@ -428,13 +1154,15 @@ Write-Host '================================================================' -F
 Write-Host ' SQL Server Database Storage Inventory' -ForegroundColor Cyan
 Write-Host '================================================================' -ForegroundColor Cyan
 Write-Host (" Input files       : {0}" -f $loadedFiles.Count)
+Write-Host (" Unique servers    : {0}" -f $servers.Count)
 Write-Host (" Unique instances  : {0}" -f $instances.Count)
-Write-Host (" Authentication    : {0}" -f $authentication)
+Write-Host (" SQL authentication: {0}" -f $sqlAuthentication)
+Write-Host (" Instance discovery: {0}" -f $discoveryAuthentication)
 Write-Host (" System databases  : {0}" -f $(if ($ExcludeSystemDatabases) { 'Excluded' } else { 'Included' }))
 Write-Host (" Output CSV        : {0}" -f $OutputCsv)
 Write-Host (" Diagnostic log    : {0}" -f $script:DiagnosticLogPath)
 if ($skippedRows -gt 0) {
-    $message = "Skipped $skippedRows discovery row(s) without a connectable instance name."
+    $message = "Skipped $skippedRows discovery row(s) without a server name, FQDN, or IP address."
     $diagnosticId = Write-Diagnostic -Level WARNING -Context 'Discovery row validation' -Message $message
     Write-Warning "$message Diagnostic ID: $diagnosticId"
 }
@@ -443,26 +1171,120 @@ Write-Host ''
 $results = [System.Collections.Generic.List[object]]::new()
 $current = 0
 
-foreach ($instance in ($instances.Values | Sort-Object DataSource)) {
+foreach ($instance in ($instances.Values | Sort-Object ServerKey, InstanceName)) {
     $current++
     $row = $instance.DiscoveryRow
-    $dataSource = $instance.DataSource
+    $dataSource = $instance.DataSources[0]
+    $sqlTcpPort = $instance.TcpPorts -join '; '
+    $multipleSQLInstances = if ($instanceCountByServer[$instance.ServerKey] -gt 1) { 'Yes' } else { 'No' }
+    $sqlVersion = Get-PropertyValue -InputObject $row -Name 'SQLVersion'
+    $sqlRelease = Get-PropertyValue -InputObject $row -Name 'SQLRelease'
     $connection = $null
+    $sqlVCoreCount = $null
     $databaseCount = $null
     $databasesMeasured = 0
     $dataUsedMb = 0.0
     $logUsedMb = 0.0
     $issues = [System.Collections.Generic.List[string]]::new()
     $status = 'OK'
+    $connectivityDetail = ''
+    $skipSqlConnection = $false
+
+    if (-not [string]::IsNullOrWhiteSpace($instance.ServiceState) -and
+        $instance.ServiceState -ne 'Running') {
+        $status = 'STOPPED'
+        $connectivityDetail = "SQL Server service state is $($instance.ServiceState)."
+        $skipSqlConnection = $true
+    }
+    elseif ($instance.TcpEnabled -eq 0 -and $instance.NamedPipesEnabled -eq 0) {
+        $status = 'NOT CONNECTABLE'
+        $connectivityDetail = 'TCP/IP and Named Pipes are disabled; the instance accepts local connections only.'
+        $diagnosticId = Write-Diagnostic -Level WARNING `
+            -Context "Assessing connectivity for '$($instance.ServerKey)\$($instance.InstanceName)'" `
+            -Message $connectivityDetail
+        $issues.Add("[Diagnostic $diagnosticId] $connectivityDetail")
+        Write-Warning "Skipping '$($instance.ServerKey)\$($instance.InstanceName)': $connectivityDetail Diagnostic ID: $diagnosticId"
+        $skipSqlConnection = $true
+    }
 
     Write-Progress -Activity 'Measuring SQL database storage' `
-        -Status ("{0} ({1} of {2})" -f $dataSource, $current, $instances.Count) `
+        -Status ("{0}\{1} ({2} of {3})" -f $instance.ServerKey, $instance.InstanceName,
+            $current, $instances.Count) `
         -PercentComplete (($current / $instances.Count) * 100)
 
+    if (-not $skipSqlConnection) {
     try {
-        $connectionString = New-SqlConnectionString -DataSource $dataSource -Database 'master'
-        $connection = [System.Data.SqlClient.SqlConnection]::new($connectionString)
-        $connection.Open()
+        $lastConnectionError = $null
+        foreach ($candidateDataSource in $instance.DataSources) {
+            $dataSource = $candidateDataSource
+            try {
+                $connectionString = New-SqlConnectionString -DataSource $dataSource -Database 'master'
+                $connection = [System.Data.SqlClient.SqlConnection]::new($connectionString)
+                $connection.Open()
+                break
+            }
+            catch {
+                $lastConnectionError = $_
+                if ($connection) {
+                    $connection.Dispose()
+                    $connection = $null
+                }
+            }
+        }
+
+        if (-not $connection) {
+            $attemptedTargets = $instance.DataSources -join '; '
+            $lastMessage = if ($lastConnectionError) {
+                $lastConnectionError.Exception.Message
+            }
+            else {
+                'No connection error was returned.'
+            }
+            $connectionException = [System.Exception]::new(
+                "All connection targets failed ($attemptedTargets). Last error: $lastMessage",
+                $(if ($lastConnectionError) { $lastConnectionError.Exception } else { $null })
+            )
+            throw $connectionException
+        }
+
+        if ($dataSource -match '(?i)^tcp:[^,]+,(?<Port>\d{1,5})$') {
+            $sqlTcpPort = $Matches.Port
+        }
+
+        try {
+            $serverInfo = Invoke-SqlDataTable -Connection $connection -Query @'
+SELECT CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')) AS SQLVersion;
+'@
+            $queriedVersion = [string] $serverInfo.Rows[0].SQLVersion
+            if (-not [string]::IsNullOrWhiteSpace($queriedVersion)) {
+                $sqlVersion = $queriedVersion
+                $sqlRelease = Get-SqlRelease -Version $queriedVersion
+            }
+        }
+        catch {
+            $diagnosticId = Write-Diagnostic -Level ERROR `
+                -Context "Reading SQL version on '$dataSource'" `
+                -Message 'The SQL Server version query failed.' -ErrorRecord $_
+            $issues.Add("[Diagnostic $diagnosticId] SQL version unavailable: $($_.Exception.Message)")
+            Write-Warning "SQL version query failed on '$dataSource'. Diagnostic ID: $diagnosticId. See '$script:DiagnosticLogPath'."
+        }
+
+        try {
+            $schedulerInfo = Invoke-SqlDataTable -Connection $connection -Query @'
+SELECT COUNT_BIG(*) AS SQLVCoreCount
+FROM sys.dm_os_schedulers
+WHERE scheduler_id < 1048576
+  AND status = 'VISIBLE ONLINE';
+'@
+            $sqlVCoreCount = [long] $schedulerInfo.Rows[0].SQLVCoreCount
+        }
+        catch {
+            $diagnosticId = Write-Diagnostic -Level ERROR `
+                -Context "Reading SQL-visible vCores on '$dataSource'" `
+                -Message 'The SQL scheduler query failed.' -ErrorRecord $_
+            $issues.Add("[Diagnostic $diagnosticId] SQL vCore count unavailable: $($_.Exception.Message)")
+            Write-Warning "SQL vCore count failed on '$dataSource'. Diagnostic ID: $diagnosticId. See '$script:DiagnosticLogPath'."
+        }
 
         $databaseFilter = if ($ExcludeSystemDatabases) {
             "WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb')"
@@ -548,6 +1370,7 @@ WHERE groupid > 0;
         $diagnosticId = Write-Diagnostic -Level ERROR -Context "Connecting to or inventorying '$dataSource'" `
             -Message 'The SQL Server instance could not be inventoried.' -ErrorRecord $_
         $issues.Add("[Diagnostic $diagnosticId] $($_.Exception.Message)")
+        $connectivityDetail = "Connection failed. Diagnostic ID: $diagnosticId"
         Write-Warning "Inventory failed for '$dataSource'. Diagnostic ID: $diagnosticId. See '$script:DiagnosticLogPath'."
     }
     finally {
@@ -565,21 +1388,34 @@ WHERE groupid > 0;
             }
         }
     }
+    }
 
     $totalUsedMb = $dataUsedMb + $logUsedMb
+    $hasMeasurements = $status -in @('OK', 'PARTIAL')
     $results.Add([pscustomobject][ordered]@{
         ServerName          = Get-PropertyValue -InputObject $row -Name 'ServerName'
-        InstanceName        = Get-PropertyValue -InputObject $row -Name 'InstanceName'
+        InstanceName        = $instance.InstanceName
+        MultipleSQLInstances = $multipleSQLInstances
+        InstanceDiscoverySource = $instance.InstanceDiscoverySource
         FQDN                = Get-PropertyValue -InputObject $row -Name 'FQDN'
         IPAddress           = Get-PropertyValue -InputObject $row -Name 'IPAddress'
         DataSource          = $dataSource
-        SQLRelease          = Get-PropertyValue -InputObject $row -Name 'SQLRelease'
-        SQLVersion          = Get-PropertyValue -InputObject $row -Name 'SQLVersion'
+        SQLInstanceKey      = $instance.InstanceKey
+        SQLTcpPort          = $sqlTcpPort
+        SQLNamedPipe        = $instance.ConfiguredNamedPipe
+        SQLServiceState     = $instance.ServiceState
+        SQLServiceStartMode = $instance.ServiceStartMode
+        TCPEnabled          = if ($null -eq $instance.TcpEnabled) { 'Unknown' } elseif ($instance.TcpEnabled -eq 1) { 'Yes' } else { 'No' }
+        NamedPipesEnabled   = if ($null -eq $instance.NamedPipesEnabled) { 'Unknown' } elseif ($instance.NamedPipesEnabled -eq 1) { 'Yes' } else { 'No' }
+        ConnectivityDetail  = $connectivityDetail
+        SQLRelease          = $sqlRelease
+        SQLVersion          = $sqlVersion
+        SQLVCoreCount       = $sqlVCoreCount
         DatabaseCount       = $databaseCount
         DatabasesMeasured   = $databasesMeasured
-        DataUsedGB          = if ($status -eq 'FAILED') { $null } else { [Math]::Round($dataUsedMb / 1024.0, 3) }
-        LogUsedGB           = if ($status -eq 'FAILED') { $null } else { [Math]::Round($logUsedMb / 1024.0, 3) }
-        TotalStorageUsedGB  = if ($status -eq 'FAILED') { $null } else { [Math]::Round($totalUsedMb / 1024.0, 3) }
+        DataUsedGB          = if ($hasMeasurements) { [Math]::Round($dataUsedMb / 1024.0, 3) } else { $null }
+        LogUsedGB           = if ($hasMeasurements) { [Math]::Round($logUsedMb / 1024.0, 3) } else { $null }
+        TotalStorageUsedGB  = if ($hasMeasurements) { [Math]::Round($totalUsedMb / 1024.0, 3) } else { $null }
         Status              = $status
         ScanTime            = Get-Date -Format 's'
     })
@@ -588,8 +1424,8 @@ WHERE groupid > 0;
 Write-Progress -Activity 'Measuring SQL database storage' -Completed
 
 $sorted = @($results | Sort-Object ServerName, InstanceName)
-$sorted | Format-Table ServerName, InstanceName, DatabaseCount, DatabasesMeasured,
-    DataUsedGB, LogUsedGB, TotalStorageUsedGB, Status -AutoSize
+$sorted | Format-Table ServerName, InstanceName, MultipleSQLInstances, SQLVCoreCount, DatabaseCount,
+    DataUsedGB, TotalStorageUsedGB, Status -AutoSize
 
 try {
     $outputDirectory = Split-Path -Parent $OutputCsv
@@ -608,10 +1444,14 @@ catch {
 $okCount = @($sorted | Where-Object { $_.Status -eq 'OK' }).Count
 $partialCount = @($sorted | Where-Object { $_.Status -eq 'PARTIAL' }).Count
 $failedCount = @($sorted | Where-Object { $_.Status -eq 'FAILED' }).Count
+$stoppedCount = @($sorted | Where-Object { $_.Status -eq 'STOPPED' }).Count
+$notConnectableCount = @($sorted | Where-Object { $_.Status -eq 'NOT CONNECTABLE' }).Count
 
 Write-Host ("Successful        : {0}" -f $okCount)
 Write-Host ("Partial           : {0}" -f $partialCount)
 Write-Host ("Failed            : {0}" -f $failedCount)
+Write-Host ("Stopped           : {0}" -f $stoppedCount)
+Write-Host ("Not connectable   : {0}" -f $notConnectableCount)
 Write-Host ("Elapsed           : {0:N1} seconds" -f ((Get-Date) - $script:StartTime).TotalSeconds)
 Write-Host ''
 }

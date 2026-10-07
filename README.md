@@ -24,7 +24,7 @@ Both scripts enrich discovered instances by reading the Windows registry remotel
 |---|---|
 | [`SQL-Discovery-DomainController.ps1`](./SQL-Discovery-DomainController.ps1) | Discovers SQL Server instances through Active Directory SPNs |
 | [`SQL-Discovery-MemberServer.ps1`](./SQL-Discovery-MemberServer.ps1) | Scans an IPv4 subnet for SQL Server instances |
-| [`SQL-Database-Storage-Inventory.ps1`](./SQL-Database-Storage-Inventory.ps1) | Counts databases and measures actual data and transaction-log storage used |
+| [`SQL-Database-Storage-Inventory.ps1`](./SQL-Database-Storage-Inventory.ps1) | Reports SQL-visible vCores, database counts, and actual data and transaction-log storage used per instance |
 | [`SQL-Discovery-Toolkit.md`](./SQL-Discovery-Toolkit.md) | Full design, usage, reference, and troubleshooting guide |
 | [`SQL-Discovery-DomainController.sample.csv`](./SQL-Discovery-DomainController.sample.csv) | Sanitized example Active Directory discovery output |
 | [`SQL-Discovery-MemberServer.sample.csv`](./SQL-Discovery-MemberServer.sample.csv) | Sanitized example subnet discovery output |
@@ -47,12 +47,31 @@ The scripts are complementary. Active Directory discovery is fast but can miss i
 ### How it connects
 
 The storage inventory uses .NET `System.Data.SqlClient.SqlConnection` to make a
-normal SQL Server connection from the member server. It does not use remote
-PowerShell, WMI, or the remote registry for database measurements.
+normal SQL Server connection from the member server for database measurements.
+Before connecting, it expands each host from the discovery CSVs into individual
+instances using SQL Browser and, by default, Windows WMI/remote-registry access.
+The original discovery scripts remain responsible only for identifying hosts
+and the instances they already know about.
 
-Connection targets are derived from each discovery CSV row:
+For named instances, the inventory reads `TcpPort` and `TcpDynamicPorts` from
+the instance's `SuperSocketNetLib\Tcp` registry configuration. This allows a
+direct `tcp:FQDN,port` connection when SQL Browser is stopped or UDP 1434 is
+blocked. If those configured values are unavailable, it maps each running SQL
+service process to its active non-loopback TCP listeners. The script tries all
+resolved direct TCP targets before falling back to `FQDN\InstanceName`. The
+resolved or successfully used value is exported in `SQLTcpPort`.
 
-- A detected TCP port becomes `tcp:FQDN,port`.
+The inventory also reads SQL service state and whether TCP/IP or Named Pipes is
+enabled. Named Pipes is attempted explicitly when enabled. A running instance
+with both remote protocols disabled cannot be queried from the inventory host;
+it is retained in the CSV with `Status=NOT CONNECTABLE` and an explanatory
+`ConnectivityDetail` instead of being reported as an unexplained error 26.
+Enable a remote SQL protocol and restart that SQL instance before rerunning if
+vCore, database, and storage measurements are required for such an instance.
+
+Connection targets are derived from the expanded instance list:
+
+- A SQL Browser or CSV-detected TCP port becomes `tcp:FQDN,port`.
 - A named instance becomes `FQDN\InstanceName`.
 - A default instance without a detected port uses its FQDN or server name.
 
@@ -60,7 +79,7 @@ The member server must be able to resolve the target name and reach the SQL
 Server listening port through intervening firewalls. Named instances without a
 known port may also require SQL Server Browser/UDP 1434.
 
-Authentication behavior is:
+SQL connection authentication is:
 
 1. **Windows Integrated Authentication is the default.** If
    `-Credential` is omitted and `-AuthMode CurrentUser` is active,
@@ -87,6 +106,18 @@ To use a different Windows identity, launch PowerShell as that identity and run
 the script with the default `-AuthMode CurrentUser`. A SQL connection cannot
 use a `PSCredential` as an alternate Windows identity merely by placing it in a
 connection string.
+
+Instance-discovery authentication is configured separately:
+
+- `-InstanceDiscoveryAuthMode CurrentUser` uses the current Windows identity
+  for WMI and remote-registry discovery and is the default.
+- `-InstanceDiscoveryAuthMode Prompt` securely prompts for a Windows
+  credential.
+- `-DiscoveryCredential` supplies a Windows `PSCredential` non-interactively
+  and never uses it for SQL connections.
+- `-InstanceDiscoveryAuthMode BrowserOnly` skips WMI/registry access and uses
+  SQL Browser plus instances already listed in the discovery CSVs. This mode
+  may miss stopped or hidden instances and instances behind blocked UDP 1434.
 
 Encryption is not explicitly requested by default. Use `-Encrypt` to request an
 encrypted connection. Use `-TrustServerCertificate` only when permitted by your
@@ -204,7 +235,8 @@ identity:
               '.\SQL-Discovery-MemberServer.csv'
 ```
 
-The script deduplicates instances present in both files. Actual used storage
+The script deduplicates hosts present in both files, expands their instance
+lists, and then deduplicates the resulting instances. Actual used storage
 includes occupied data pages and used transaction-log space. System databases
 are included unless `-ExcludeSystemDatabases` is supplied:
 
@@ -225,6 +257,30 @@ overrides `-AuthMode`:
 ```powershell
 $credential = Get-Credential
 .\SQL-Database-Storage-Inventory.ps1 -Credential $credential
+```
+
+To prompt separately for the Windows credential used to expand instances:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 -InstanceDiscoveryAuthMode Prompt
+```
+
+To use separate non-interactive Windows discovery and SQL credentials:
+
+```powershell
+$windowsCredential = Get-Credential -Message 'Windows discovery account'
+$sqlCredential = Get-Credential -Message 'SQL login'
+
+.\SQL-Database-Storage-Inventory.ps1 `
+    -DiscoveryCredential $windowsCredential `
+    -Credential $sqlCredential
+```
+
+To avoid authenticated Windows discovery:
+
+```powershell
+.\SQL-Database-Storage-Inventory.ps1 `
+    -InstanceDiscoveryAuthMode BrowserOnly
 ```
 
 To request encryption:
@@ -249,6 +305,9 @@ does not trust, and policy permits bypassing certificate validation:
 | `-DiagnosticLog` | `.\SQL-Database-Storage-Inventory-Diagnostics.txt` | Append-only error details; created or modified only when a warning or error occurs |
 | `-AuthMode` | `CurrentUser` | Uses the current Windows identity, or securely prompts for a SQL login when set to `Prompt` |
 | `-Credential` | None | Uses a supplied SQL-login `PSCredential` and takes precedence over `-AuthMode`; `-SqlCredential` is retained as an alias |
+| `-InstanceDiscoveryAuthMode` | `CurrentUser` | Uses the current Windows identity, prompts for a Windows account, or selects unauthenticated `BrowserOnly` expansion |
+| `-DiscoveryCredential` | None | Windows `PSCredential` used only for WMI/registry instance discovery; `-WindowsCredential` and `-InstanceDiscoveryCredential` are aliases |
+| `-InstanceDiscoveryTimeoutMs` | `1000` | SQL Browser UDP response timeout per discovered host |
 | `-ExcludeSystemDatabases` | Off | Excludes `master`, `model`, `msdb`, and `tempdb` |
 | `-ConnectionTimeoutSeconds` | `10` | SQL connection timeout per instance |
 | `-CommandTimeoutSeconds` | `30` | SQL command timeout per query |
