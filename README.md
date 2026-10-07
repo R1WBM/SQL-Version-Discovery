@@ -318,21 +318,25 @@ does not trust, and policy permits bypassing certificate validation:
 
 The default report is written to
 `.\SQL-Database-Storage-Inventory.csv`. Instances or databases that cannot be
-queried remain in the report with `FAILED` or `PARTIAL` status.
+fully queried remain in the report with an explanatory `PARTIAL`, `FAILED`,
+`STOPPED`, or `NOT CONNECTABLE` status.
 
 Review the sanitized example report:
 
 - [`SQL-Database-Storage-Inventory.sample.csv`](./SQL-Database-Storage-Inventory.sample.csv)
 
-The sample shows one successfully queried default instance with six databases.
-All six were measured, using 1.691 GB of data pages and 0.006 GB of transaction
-log space, for 1.697 GB total actual storage used. Inventory columns include:
+The sample shows a default instance with six databases and a named `REPORTING`
+instance with four databases. All ten databases were measured. The default
+instance uses 1.691 GB of data pages and 0.006 GB of transaction-log space
+(1.697 GB total); the named instance uses 0.850 GB of data pages and 0.004 GB
+of transaction-log space (0.854 GB total). Inventory columns include:
 
 - Server, instance, FQDN, IP address, and SQL connection target
 - SQL Server release and version inherited from discovery
 - Total databases found and databases successfully measured
 - Actual data, transaction-log, and combined storage used in GB
-- `OK`, `PARTIAL`, or `FAILED` status and scan timestamp
+- `OK`, `PARTIAL`, `FAILED`, `STOPPED`, or `NOT CONNECTABLE` status and scan
+  timestamp
 
 Detailed diagnostics are appended to
 `.\SQL-Database-Storage-Inventory-Diagnostics.txt` by default. Console warnings
@@ -345,7 +349,7 @@ location. The text file includes timestamps, exception and inner-exception
 details, PowerShell and .NET stack traces, SQL error numbers, operation context,
 the executing identity, and the input and output paths. Processing continues
 after individual server or database failures, and every discovered instance
-remains in the CSV with its `OK`, `PARTIAL`, or `FAILED` status.
+remains in the CSV with an explanatory status.
 
 ## Requirements
 
