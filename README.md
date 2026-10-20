@@ -50,9 +50,9 @@ connectivity between them.
 
 | VM name | Description and lab role |
 |---|---|
-| `Sqltest-dc01` | Domain Controller. The Domain Controller discovery script was run from this VM in the lab. |
-| `Sqltest-fs-1` | File Server / Member Server. Central location for the scripts and their outputs, and the VM used to run the member-server discovery and database storage inventory scripts. |
-| `Sqltest-sql01` | SQL Server with a single instance and multiple databases. |
+| <code>Sqltest&#8209;dc01</code> | Domain Controller. The Domain Controller discovery script was run from this VM in the lab. |
+| <code>Sqltest&#8209;fs&#8209;1</code> | File Server / Member Server. Central location for the scripts and their outputs, and the VM used to run the member-server discovery and database storage inventory scripts. |
+| <code>Sqltest&#8209;sql01</code> | SQL Server with a single instance and multiple databases. |
 
 ### Demo videos
 
