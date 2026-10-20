@@ -42,6 +42,24 @@ Both scripts enrich discovered instances by reading the Windows registry remotel
 
 The scripts are complementary. Active Directory discovery is fast but can miss instances without an SPN. Subnet discovery can find unregistered instances but is limited to the authorized networks and ports you scan.
 
+## Demo in a Lab
+
+The demos were recorded in a lab built with three virtual machines (VMs), as
+listed below. All three VMs were on the same network, with no firewalls blocking
+connectivity between them.
+
+| VM name | Description and lab role |
+|---|---|
+| `Sqltest-dc01` | Domain Controller. The Domain Controller discovery script was run from this VM in the lab. |
+| `Sqltest-fs-1` | File Server / Member Server. Central location for the scripts and their outputs, and the VM used to run the member-server discovery and database storage inventory scripts. |
+| `Sqltest-sql01` | SQL Server with a single instance and multiple databases. |
+
+### Demo videos
+
+- [Domain Controller discovery and output](./demo-videos/SQL%20Discovery%20from%20Domain%20Controller%20plus%20output.mp4) - Demonstrates running Active Directory discovery from the Domain Controller and viewing the output.
+- [Member Server discovery](./demo-videos/SQL%20Discovery%20from%20Member%20Server.mp4) - Demonstrates running subnet discovery from the Member Server.
+- [Database storage inventory and outputs](./demo-videos/SQL%20Discovery%20DB%20Inventory%20%2B%20outputs.mp4) - Demonstrates running the database storage inventory and viewing its outputs.
+
 ## Database storage inventory
 
 ### How it connects
