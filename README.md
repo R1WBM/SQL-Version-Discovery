@@ -57,8 +57,16 @@ connectivity between them.
 ### Demo videos
 
 - [Domain Controller discovery and output](./demo-videos/SQL%20Discovery%20from%20Domain%20Controller%20plus%20output.mp4) - Demonstrates running Active Directory discovery from the Domain Controller and viewing the output.
+
+https://github.com/user-attachments/assets/18376287-34d4-485f-9f31-47992f896900
+
 - [Member Server discovery](./demo-videos/SQL%20Discovery%20from%20Member%20Server.mp4) - Demonstrates running subnet discovery from the Member Server.
+
+https://github.com/user-attachments/assets/67ae0536-89b0-4239-a368-654b28871ae5
+
 - [Database storage inventory and outputs](./demo-videos/SQL%20Discovery%20DB%20Inventory%20%2B%20outputs.mp4) - Demonstrates running the database storage inventory and viewing its outputs.
+
+https://github.com/user-attachments/assets/825237e6-d195-4a1b-99e2-5d36fd82dfd3
 
 ## Database storage inventory
 
